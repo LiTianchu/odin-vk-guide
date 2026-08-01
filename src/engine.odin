@@ -7,6 +7,7 @@ import "vendor:glfw"
 import vk "vendor:vulkan"
 
 import "libs:vkb"
+import "libs:vma"
 
 TITLE :: "My Renderer"
 
@@ -17,6 +18,7 @@ Frame_Data :: struct {
 	main_command_buffer: vk.CommandBuffer,
 	swapchain_semaphore: vk.Semaphore,
 	render_fence:        vk.Fence,
+	deletion_queue:      Deletion_Queue,
 }
 
 FRAME_OVERLAP :: 2
@@ -50,6 +52,14 @@ Engine :: struct {
 	frame_number:               int,
 	graphics_queue:             vk.Queue,
 	graphics_queue_family:      u32,
+
+	// Memory management
+	vma_allocator:              vma.Allocator,
+	main_deletion_queue:        Deletion_Queue,
+
+	// Rendering resources
+	draw_image:                 Allocated_Image,
+	draw_extent:                vk.Extent2D,
 }
 
 engine_get_current_frame :: #force_inline proc(self: ^Engine) -> ^Frame_Data #no_bounds_check {
@@ -96,9 +106,9 @@ engine_init :: proc(self: ^Engine) -> (ok: bool) {
 }
 
 
+// DRAW LOOP EVENT
 @(require_results)
 engine_draw :: proc(self: ^Engine) -> (ok: bool) {
-	// DRAW LOOP
 	// Steps:
 	// 1. Waits for the GPU to finish the previous frame
 	// 2. Acquires the next swapchain image
@@ -110,6 +120,9 @@ engine_draw :: proc(self: ^Engine) -> (ok: bool) {
 
 	// Step 1. Wait for the GPU to finish rendering the last frame, timeout of 1 sec
 	vk_check(vk.WaitForFences(self.vk_device, 1, &frame.render_fence, true, 1e9)) or_return
+
+	deletion_queue_flush(&frame.deletion_queue)
+
 	vk_check(vk.ResetFences(self.vk_device, 1, &frame.render_fence)) or_return
 
 	// Step 2. Acquire the next swapchain image
@@ -388,6 +401,29 @@ engine_init_vulkan :: proc(self: ^Engine) -> (ok: bool) {
 	self.graphics_queue = graphics_queue
 	self.graphics_queue_family = graphics_queue_family
 
+
+	deletion_queue_init(&self.main_deletion_queue, self.vk_device)
+
+	vma_vulkan_functions := vma.create_vulkan_functions()
+
+	api_version := min(
+		self.vkb.instance.api_version,
+		self.vkb.physical_device.vk_properties.apiVersion,
+	)
+
+	vma_create_info: vma.AllocatorCreateInfo = {
+		flags            = {.BUFFER_DEVICE_ADDRESS},
+		instance         = self.vk_instance,
+		physicalDevice   = self.vk_physical_device,
+		device           = self.vk_device,
+		pVulkanFunctions = &vma_vulkan_functions,
+		vulkanApiVersion = api_version,
+	}
+
+	vk_check(vma.CreateAllocator(vma_create_info, &self.vma_allocator)) or_return
+
+	deletion_queue_push(&self.main_deletion_queue, self.vma_allocator)
+
 	return true
 }
 
@@ -501,7 +537,11 @@ engine_cleanup :: proc(self: ^Engine) {
 		// destroy sync objects
 		vk.DestroyFence(self.vk_device, frame.render_fence, nil)
 		vk.DestroySemaphore(self.vk_device, frame.swapchain_semaphore, nil)
+
+		deletion_queue_destroy(&frame.deletion_queue)
 	}
+
+	deletion_queue_destroy(&self.main_deletion_queue)
 
 	engine_destroy_swapchain(self)
 	vk.DestroySurfaceKHR(self.vk_instance, self.vk_surface, nil)
@@ -521,6 +561,8 @@ engine_init_commands :: proc(self: ^Engine) -> (ok: bool) {
 	)
 
 	for &frame in self.frames {
+		deletion_queue_init(&frame.deletion_queue, self.vk_device)
+
 		vk_check(
 			vk.CreateCommandPool(self.vk_device, &command_pool_info, nil, &frame.command_pool),
 		) or_return
