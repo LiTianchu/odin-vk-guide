@@ -6,7 +6,6 @@
 !/build/assets/**
 
 # Project
-src/*
 !src/.gitkeep
 !src/README.md
 

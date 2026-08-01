@@ -1,0 +1,49 @@
+package main
+import "core:log"
+import "core:mem"
+
+start :: proc() -> (ok: bool) {
+	engine := new(Engine)
+
+	ensure(engine != nil, "Failed to allocate 'Engine' object")
+
+	defer free(engine)
+
+	engine_init(engine) or_return
+
+	defer engine_cleanup(engine)
+
+	// start running loop
+	engine_run(engine) or_return
+
+	return true
+}
+
+main :: proc() {
+	when ODIN_DEBUG {
+		context.logger = log.create_console_logger(opt = {.Level, .Terminal_Color})
+		defer log.destroy_console_logger(context.logger)
+		log.info("Running in debug mode...")
+
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+
+		defer {
+			if len(track.allocation_map) > 0 {
+				log.errorf("=== %v allocations not freed: ===", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					log.debugf("%v bytes @ %v", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				log.errorf("=== %v incorrect frees: ===", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					log.debugf("%p @ %v", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
+	start()
+}
