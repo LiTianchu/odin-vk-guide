@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import "core:log"
+import "core:math"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -11,16 +12,25 @@ TITLE :: "My Renderer"
 
 DEFAULT_WINDOW_EXTENT :: vk.Extent2D{1280, 678}
 
+Frame_Data :: struct {
+	command_pool:        vk.CommandPool,
+	main_command_buffer: vk.CommandBuffer,
+	swapchain_semaphore: vk.Semaphore,
+	render_fence:        vk.Fence,
+}
+
+FRAME_OVERLAP :: 2
+
 Engine :: struct {
-	window:                glfw.WindowHandle,
-	window_extent:         vk.Extent2D,
-	is_initialized:        bool,
-	stop_rendering:        bool,
-	vk_instance:           vk.Instance,
-	vk_physical_device:    vk.PhysicalDevice,
-	vk_surface:            vk.SurfaceKHR,
-	vk_device:             vk.Device,
-	vkb:                   struct {
+	window:                     glfw.WindowHandle,
+	window_extent:              vk.Extent2D,
+	is_initialized:             bool,
+	stop_rendering:             bool,
+	vk_instance:                vk.Instance,
+	vk_physical_device:         vk.PhysicalDevice,
+	vk_surface:                 vk.SurfaceKHR,
+	vk_device:                  vk.Device,
+	vkb:                        struct {
 		instance:        vkb.Instance,
 		physical_device: vkb.Physical_Device,
 		device:          vkb.Device,
@@ -28,12 +38,24 @@ Engine :: struct {
 	},
 
 	// swap chain
-	vk_swapchain:          vk.SwapchainKHR,
-	swapchain_format:      vk.Format,
-	swapchain_extent:      vk.Extent2D,
-	swapchain_images:      []vk.Image,
-	swapchain_image_views: []vk.ImageView,
+	vk_swapchain:               vk.SwapchainKHR,
+	swapchain_format:           vk.Format,
+	swapchain_extent:           vk.Extent2D,
+	swapchain_images:           []vk.Image,
+	swapchain_image_views:      []vk.ImageView,
+	swapchain_image_semaphores: []vk.Semaphore,
+
+	// Frame resources
+	frames:                     [FRAME_OVERLAP]Frame_Data,
+	frame_number:               int,
+	graphics_queue:             vk.Queue,
+	graphics_queue_family:      u32,
 }
+
+engine_get_current_frame :: #force_inline proc(self: ^Engine) -> ^Frame_Data #no_bounds_check {
+	return &self.frames[self.frame_number % FRAME_OVERLAP]
+}
+
 
 @(private)
 g_logger: log.Logger
@@ -76,6 +98,99 @@ engine_init :: proc(self: ^Engine) -> (ok: bool) {
 
 @(require_results)
 engine_draw :: proc(self: ^Engine) -> (ok: bool) {
+	// DRAW LOOP
+	// Steps:
+	// 1. Waits for the GPU to finish the previous frame
+	// 2. Acquires the next swapchain image
+	// 3. Records rendering commands into a command buffer
+	// 4. Submits the command buffer to the GPU for execution
+	// 5. Presents the rendered image to the screen
+
+	frame := engine_get_current_frame(self)
+
+	// Step 1. Wait for the GPU to finish rendering the last frame, timeout of 1 sec
+	vk_check(vk.WaitForFences(self.vk_device, 1, &frame.render_fence, true, 1e9)) or_return
+	vk_check(vk.ResetFences(self.vk_device, 1, &frame.render_fence)) or_return
+
+	// Step 2. Acquire the next swapchain image
+	swapchain_image_index: u32 = ---
+	vk_check(
+		vk.AcquireNextImageKHR(
+			self.vk_device,
+			self.vk_swapchain,
+			1000000000,
+			frame.swapchain_semaphore,
+			0,
+			&swapchain_image_index,
+		),
+	) or_return
+
+
+	// Step 3.  Record rendering commands into a command buffer
+	cmd := frame.main_command_buffer
+	vk_check(vk.ResetCommandBuffer(cmd, {})) or_return
+	cmd_begin_info := command_buffer_begin_info({.ONE_TIME_SUBMIT})
+	vk_check(vk.BeginCommandBuffer(cmd, &cmd_begin_info)) or_return
+
+	// Step 4. Submits the command buffer to the GPU for execution
+	transition_image_layout(
+		cmd,
+		self.swapchain_images[swapchain_image_index],
+		.UNDEFINED,
+		.GENERAL,
+	)
+
+	// make a clear_color from frame number
+	flash := abs(math.sin(f32(self.frame_number) / 120.0))
+
+	clear_value := vk.ClearColorValue {
+		float32 = {0.0, 0.0, flash, 1.0},
+	}
+
+	clear_range := image_subresource_range({.COLOR})
+
+	vk.CmdClearColorImage(
+		cmd,
+		self.swapchain_images[swapchain_image_index],
+		.GENERAL,
+		&clear_value,
+		1,
+		&clear_range,
+	)
+
+	transition_image_layout(
+		cmd,
+		self.swapchain_images[swapchain_image_index],
+		.GENERAL,
+		.PRESENT_SRC_KHR, // image layout for presenting to the screen
+	)
+
+	vk_check(vk.EndCommandBuffer(cmd)) or_return
+
+	ready_for_present_semaphore := self.swapchain_image_semaphores[swapchain_image_index]
+
+	cmd_info := command_buffer_submit_info(cmd)
+	signal_info := semaphore_submit_info({.ALL_GRAPHICS}, ready_for_present_semaphore)
+	wait_info := semaphore_submit_info({.COLOR_ATTACHMENT_OUTPUT_KHR}, frame.swapchain_semaphore)
+	submit := submit_info(&cmd_info, &signal_info, &wait_info)
+
+	vk_check(vk.QueueSubmit2(self.graphics_queue, 1, &submit, frame.render_fence)) or_return
+
+
+	// Step 5. Present the rendered image onto the screen
+	present_info := vk.PresentInfoKHR {
+		sType              = .PRESENT_INFO_KHR,
+		pSwapchains        = &self.vk_swapchain,
+		swapchainCount     = 1,
+		pWaitSemaphores    = &ready_for_present_semaphore,
+		waitSemaphoreCount = 1,
+		pImageIndices      = &swapchain_image_index,
+	}
+
+	vk_check(vk.QueuePresentKHR(self.graphics_queue, &present_info)) or_return
+
+	self.frame_number += 1
+
 	return true
 }
 
@@ -100,6 +215,7 @@ engine_run :: proc(self: ^Engine) -> (ok: bool) {
 	return true
 }
 
+@(require_results)
 engine_init_vulkan :: proc(self: ^Engine) -> (ok: bool) {
 	ta := context.temp_allocator
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -253,14 +369,35 @@ engine_init_vulkan :: proc(self: ^Engine) -> (ok: bool) {
 	self.vk_device = self.vkb.device.vk_device
 	log.info("Vulkan Device built successfully!")
 
+	// Get graphics queue
+	graphics_queue, graphics_queue_err := vkb.device_get_queue(self.vkb.device, .Graphics)
+	if graphics_queue_err != nil {
+		log.errorf("Failed to get graphics queue: %#v", graphics_queue_err)
+		return
+	}
+
+	graphics_queue_family, graphics_queue_family_err := vkb.device_get_queue_index(
+		self.vkb.device,
+		.Graphics,
+	)
+	if graphics_queue_family_err != nil {
+		log.errorf("Failed to get graphics queue family: %#v", graphics_queue_family_err)
+		return
+	}
+
+	self.graphics_queue = graphics_queue
+	self.graphics_queue_family = graphics_queue_family
+
 	return true
 }
 
+@(require_results)
 engine_init_swapchain :: proc(self: ^Engine) -> (ok: bool) {
 	engine_create_swapchain(self, self.window_extent) or_return
 	return true
 }
 
+@(require_results)
 engine_create_swapchain :: proc(self: ^Engine, extent: vk.Extent2D) -> (ok: bool) {
 	ta := context.temp_allocator
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
@@ -315,13 +452,33 @@ engine_create_swapchain :: proc(self: ^Engine, extent: vk.Extent2D) -> (ok: bool
 	self.swapchain_image_views = swapchain_image_views
 	log.info("Vulkan Swapchain built successfully!")
 
+	// reserve memory for semaphore creation
+	self.swapchain_image_semaphores = make([]vk.Semaphore, len(self.swapchain_images))[:]
+	defer if !ok {delete(self.swapchain_image_semaphores)}
+
+	// get semaphore create info
+	semaphore_create_info := semaphore_create_info()
+
+	// create semaphores for each swapchain image
+	for &semaphore in self.swapchain_image_semaphores {
+		vk_check(
+			vk.CreateSemaphore(self.vk_device, &semaphore_create_info, nil, &semaphore),
+		) or_return
+	}
+
 
 	return true
 }
 
 engine_destroy_swapchain :: proc(self: ^Engine) {
-	vkb.swapchain_destroy_image_views(self.vkb.swapchain, self.swapchain_image_views)
 	vkb.destroy_swapchain(&self.vkb.swapchain)
+	vkb.swapchain_destroy_image_views(self.vkb.swapchain, self.swapchain_image_views)
+
+	for semaphore in self.swapchain_image_semaphores {
+		vk.DestroySemaphore(self.vk_device, semaphore, nil)
+	}
+
+	delete(self.swapchain_image_semaphores)
 	delete(self.swapchain_image_views)
 	delete(self.swapchain_images)
 }
@@ -334,7 +491,18 @@ engine_cleanup :: proc(self: ^Engine) {
 
 	// need to delete the objects in correct order as they have dependencies
 	// in general, they should be deleted in the opposite order of the initialization
-	// initialization order: GLFW Window -> VK Instance -> VK Surface -> VK Device -> VK Swapchain
+	// initialization order: GLFW Window -> VK Instance -> VK Surface -> VK Device -> VK Swapchain -> VK Command Pool
+
+	ensure(vk.DeviceWaitIdle(self.vk_device) == .SUCCESS) // make sure the gpu has stopped
+
+	for &frame in self.frames {
+		vk.DestroyCommandPool(self.vk_device, frame.command_pool, nil)
+
+		// destroy sync objects
+		vk.DestroyFence(self.vk_device, frame.render_fence, nil)
+		vk.DestroySemaphore(self.vk_device, frame.swapchain_semaphore, nil)
+	}
+
 	engine_destroy_swapchain(self)
 	vk.DestroySurfaceKHR(self.vk_instance, self.vk_surface, nil)
 	vkb.destroy_device(&self.vkb.device)
@@ -343,11 +511,51 @@ engine_cleanup :: proc(self: ^Engine) {
 	destroy_window(self.window)
 }
 
+@(require_results)
 engine_init_commands :: proc(self: ^Engine) -> (ok: bool) {
+	// initialize command pool for commands submitted to the graphics queue
+	// also make the pool allow for resetting of individual command buffers
+	command_pool_info := command_pool_create_info(
+		self.graphics_queue_family,
+		{.RESET_COMMAND_BUFFER},
+	)
 
+	for &frame in self.frames {
+		vk_check(
+			vk.CreateCommandPool(self.vk_device, &command_pool_info, nil, &frame.command_pool),
+		) or_return
+
+		command_alloc_info := command_buffer_allocate_info(frame.command_pool)
+
+		vk_check(
+			vk.AllocateCommandBuffers(
+				self.vk_device,
+				&command_alloc_info,
+				&frame.main_command_buffer,
+			),
+		) or_return
+	}
 	return true
 }
 
+@(require_results)
 engine_init_sync_structures :: proc(self: ^Engine) -> (ok: bool) {
+	fence_create_info := fence_create_info({.SIGNALED})
+	semaphore_create_info := semaphore_create_info()
+
+	for &frame in self.frames {
+		vk_check(
+			vk.CreateFence(self.vk_device, &fence_create_info, nil, &frame.render_fence),
+		) or_return
+		vk_check(
+			vk.CreateSemaphore(
+				self.vk_device,
+				&semaphore_create_info,
+				nil,
+				&frame.swapchain_semaphore,
+			),
+		) or_return
+	}
+
 	return true
 }
